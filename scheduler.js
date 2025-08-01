@@ -188,15 +188,17 @@ async function getConfigFromCache() {
 /**
  * PROCESO PRINCIPAL: Secuencias optimizado
  */
+// 🚨 REEMPLAZA ESTA FUNCIÓN COMPLETA EN TU scheduler.js
+
 async function processSequences() {
   try {
     console.log('🔍 Iniciando processSequences optimizado...');
     
+    // ✅ SOLO UN FILTRO != - ESTO FUNCIONARÁ
     const leadsSnap = await db
       .collection('leads')
       .where('secuenciasActivas', '!=', null)
-      .where('estado', '!=', 'completado')
-      .limit(50)
+      .limit(100)
       .get();
 
     if (leadsSnap.empty) {
@@ -204,19 +206,28 @@ async function processSequences() {
       return;
     }
 
-    console.log(`📊 Procesando ${leadsSnap.docs.length} leads`);
+    // ✅ Filtrar en memoria en lugar de query
+    const activeLeads = leadsSnap.docs.filter(doc => {
+      const data = doc.data();
+      return data.estado !== 'completado' && 
+             Array.isArray(data.secuenciasActivas) && 
+             data.secuenciasActivas.length > 0;
+    }).slice(0, 50);
+
+    if (activeLeads.length === 0) {
+      console.log('✅ No hay leads activos con secuencias');
+      return;
+    }
+
+    console.log(`📊 Procesando ${activeLeads.length} leads activos`);
     
     const batch = db.batch();
     let batchCount = 0;
     const MAX_BATCH_SIZE = 10;
 
-    for (const doc of leadsSnap.docs) {
+    for (const doc of activeLeads) {
       const lead = { id: doc.id, ...doc.data() };
       
-      if (!Array.isArray(lead.secuenciasActivas) || !lead.secuenciasActivas.length) {
-        continue;
-      }
-
       let needsUpdate = false;
       const updatedSequences = [];
 
