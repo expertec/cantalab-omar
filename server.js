@@ -1,4 +1,4 @@
-// server.js CORREGIDO
+// server.js
 import express from 'express';
 import cors from 'cors';
 import bodyParser from 'body-parser';
@@ -10,19 +10,27 @@ import fs from 'fs';
 import ffmpeg from 'fluent-ffmpeg';
 import ffmpegInstaller from '@ffmpeg-installer/ffmpeg';
 import axios from 'axios';
-import os from 'os';
+import os from 'os';               // ← Asegúrate de importar
 
 import { db, admin } from './firebaseAdmin.js';
 const bucket = admin.storage().bucket();
 
+
 // Dile a fluent-ffmpeg dónde está el binario
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 
-import { sendAudioMessage } from './whatsappService.js';
-import { sendClipMessage } from './whatsappService.js';
+
+import { sendAudioMessage } from './whatsappService.js';  // ajusta ruta si es necesario
+import { sendClipMessage } from './whatsappService.js';  // ya lo tienes exportado
 import { sendFullAudioAsDocument } from './whatsappService.js';
 
+
+
+
+
 dotenv.config();
+
+
 
 import {
   connectToWhatsApp,
@@ -39,9 +47,9 @@ import {
   generarMusicaConSuno,
   procesarClips,
   enviarMusicaPorWhatsApp,
-  retryStuckMusic,
-  limpiarDocumentosStuck // 🔧 CRÍTICO: Añadir esta importación
+  retryStuckMusic
 } from './scheduler.js';
+
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -69,8 +77,10 @@ app.get('/api/whatsapp/number', (req, res) => {
   }
 });
 
+
+
 app.post('/api/suno/callback', express.json(), async (req, res) => {
-  const raw = req.body;
+  const raw    = req.body;
   const taskId = raw.taskId || raw.data?.taskId || raw.data?.task_id;
   if (!taskId) return res.sendStatus(400);
 
@@ -130,14 +140,11 @@ app.post('/api/suno/callback', express.json(), async (req, res) => {
   }
 });
 
-// 🚨 PROBLEMA CRÍTICO: Tienes DOS endpoints idénticos '/api/whatsapp/send-full'
-// 🔧 SOLUCIÓN: Combinar en uno solo y corregir la lógica
-
 /**
- * Envía la canción completa - ENDPOINT CORREGIDO Y UNIFICADO
+ * Envía la canción completa como adjunto y marca el estado.
  */
 app.post('/api/whatsapp/send-full', async (req, res) => {
-  const { leadId, asDocument = false } = req.body; // 🔧 Añadir opción para enviar como documento
+  const { leadId } = req.body;
   if (!leadId) return res.status(400).json({ error: 'Falta leadId' });
 
   try {
@@ -152,53 +159,84 @@ app.post('/api/whatsapp/send-full', async (req, res) => {
       .where('leadPhone', '==', telefono)
       .limit(1).get();
     if (musicSnap.empty) return res.status(404).json({ error: 'No hay música para este lead' });
-    
-    const musicData = musicSnap.docs[0].data();
-    const fullUrl = musicData.fullUrl;
+    const fullUrl = musicSnap.docs[0].data().fullUrl;
     if (!fullUrl) return res.status(400).json({ error: 'fullUrl no disponible' });
 
-    // 3) Enviar según el tipo solicitado
-    if (asDocument) {
-      // Enviar como documento adjunto
-      await sendFullAudioAsDocument(telefono, fullUrl);
-      console.log(`📎 Canción enviada como adjunto a ${telefono}`);
-    } else {
-      // Enviar como audio inline
-      await sendClipMessage(telefono, fullUrl);
-      console.log(`🎵 Canción enviada como audio a ${telefono}`);
-    }
+    // 3) Enviar como documento adjunto
+    await sendFullAudioAsDocument(telefono, fullUrl);
 
-    // 4) Actualizar estados con batch
-    const batch = db.batch();
-    
-    batch.update(musicSnap.docs[0].ref, {
+    // 4) Actualizar estados
+    await musicSnap.docs[0].ref.update({
       status: 'Enviada completa',
-      sentAt: admin.firestore.FieldValue.serverTimestamp(),
-      sentAsDocument: asDocument
+      sentAt: admin.firestore.FieldValue.serverTimestamp()
     });
-    
-    batch.update(db.collection('leads').doc(leadId), { 
-      estadoProduccion: 'Canción Enviada' 
-    });
+    await db.collection('leads').doc(leadId).update({ estadoProduccion: 'Canción Enviada' });
 
-    await batch.commit();
-
-    return res.json({ 
-      success: true, 
-      message: `Canción enviada ${asDocument ? 'como adjunto' : 'como audio'}` 
-    });
+    return res.json({ success: true });
   } catch (err) {
     console.error('Error en /api/whatsapp/send-full:', err);
     return res.status(500).json({ error: err.message });
   }
 });
 
+app.post('/api/whatsapp/send-full', async (req, res) => {
+  const { leadId } = req.body;
+  if (!leadId) {
+    return res.status(400).json({ error: 'Falta leadId en el body' });
+  }
+
+  try {
+    // 1) Obtén el lead y su teléfono
+    const leadSnap = await db.collection('leads').doc(leadId).get();
+    if (!leadSnap.exists) {
+      return res.status(404).json({ error: 'Lead no encontrado' });
+    }
+    const telefono = String(leadSnap.data().telefono).replace(/\D/g, '');
+
+    // 2) Busca el documento de música asociado
+    const musicSnap = await db
+      .collection('musica')
+      .where('leadPhone', '==', telefono)
+      .limit(1)
+      .get();
+    if (musicSnap.empty) {
+      return res.status(404).json({ error: 'No hay música para este lead' });
+    }
+    const musicData = musicSnap.docs[0].data();
+
+    // 3) Toma el fullUrl
+    const fullUrl = musicData.fullUrl;
+    if (!fullUrl) {
+      return res.status(400).json({ error: 'fullUrl no disponible' });
+    }
+
+    // 4) Envía la canción completa por WhatsApp
+    await sendClipMessage(telefono, fullUrl);
+
+    // 5) Actualiza status en 'musica'
+    await musicSnap.docs[0].ref.update({
+      status: 'Enviada completa',
+      sentAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    // 6) Actualiza estadoProduccion en 'leads'
+    await db.collection('leads').doc(leadId).update({
+      estadoProduccion: 'Canción Enviada'
+    });
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('Error en /api/whatsapp/send-full:', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+
 app.post('/api/whatsapp/send-clip', async (req, res) => {
   const { leadId } = req.body;
   if (!leadId) {
     return res.status(400).json({ error: 'Falta leadId en el body' });
   }
-  
   try {
     // 1) Obtener teléfono del lead
     const leadSnap = await db.collection('leads').doc(leadId).get();
@@ -238,6 +276,7 @@ app.post('/api/whatsapp/send-clip', async (req, res) => {
   }
 });
 
+
 // Endpoint para enviar mensaje de WhatsApp
 app.post('/api/whatsapp/send-message', async (req, res) => {
   const { leadId, message } = req.body;
@@ -272,8 +311,8 @@ app.post(
   upload.single('audio'),
   async (req, res) => {
     const { phone } = req.body;
-    const uploadPath = req.file.path;
-    const m4aPath = `${uploadPath}.m4a`;
+    const uploadPath = req.file.path;           // WebM/Opus crudo
+    const m4aPath   = `${uploadPath}.m4a`;      // destino M4A
 
     try {
       // 1) Transcodifica a M4A (AAC)
@@ -298,11 +337,14 @@ app.post(
       console.error('Error enviando audio:', error);
       // limpia lo que haya quedado
       try { fs.unlinkSync(uploadPath); } catch {}
-      try { fs.unlinkSync(m4aPath); } catch {}
+      try { fs.unlinkSync(m4aPath); }   catch {}
       return res.status(500).json({ success: false, error: error.message });
     }
   }
 );
+
+
+
 
 // (Opcional) Marcar todos los mensajes de un lead como leídos
 app.post('/api/whatsapp/mark-read', async (req, res) => {
@@ -312,8 +354,8 @@ app.post('/api/whatsapp/mark-read', async (req, res) => {
   }
   try {
     await db.collection('leads')
-      .doc(leadId)
-      .update({ unreadCount: 0 });
+            .doc(leadId)
+            .update({ unreadCount: 0 });
     return res.json({ success: true });
   } catch (err) {
     console.error("Error marcando como leídos:", err);
@@ -321,99 +363,29 @@ app.post('/api/whatsapp/mark-read', async (req, res) => {
   }
 });
 
-// 🔧 NUEVO ENDPOINT: Estado del sistema
-app.get('/api/system/status', async (req, res) => {
-  try {
-    // Contar documentos en diferentes estados
-    const musicStats = await Promise.all([
-      db.collection('musica').where('status', '==', 'Sin letra').get(),
-      db.collection('musica').where('status', '==', 'Sin prompt').get(),
-      db.collection('musica').where('status', '==', 'Sin música').get(),
-      db.collection('musica').where('status', '==', 'Audio listo').get(),
-      db.collection('musica').where('status', '==', 'Enviar música').get(),
-      db.collection('musica').where('status', '==', 'Enviada').get()
-    ]);
-
-    const leadsWithSequences = await db
-      .collection('leads')
-      .where('secuenciasActivas', '!=', null)
-      .get();
-
-    res.json({
-      whatsapp: {
-        status: getConnectionStatus(),
-        phone: getSessionPhone()
-      },
-      music: {
-        sinLetra: musicStats[0].size,
-        sinPrompt: musicStats[1].size,
-        sinMusica: musicStats[2].size,
-        audioListo: musicStats[3].size,
-        enviarMusica: musicStats[4].size,
-        enviada: musicStats[5].size
-      },
-      leads: {
-        conSecuenciasActivas: leadsWithSequences.size
-      },
-      timestamp: new Date().toISOString()
-    });
-  } catch (error) {
-    console.error('Error obteniendo estado del sistema:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
 // Arranca el servidor y conecta WhatsApp
 app.listen(port, () => {
-  console.log(`🚀 Servidor corriendo en el puerto ${port}`);
-  console.log(`📊 Estado del sistema disponible en: http://localhost:${port}/api/system/status`);
-  
+  console.log(`Servidor corriendo en el puerto ${port}`);
   connectToWhatsApp().catch(err =>
-    console.error("❌ Error al conectar WhatsApp en startup:", err)
+    console.error("Error al conectar WhatsApp en startup:", err)
   );
+
+
+  
 });
 
-// 🔧 CRON JOBS OPTIMIZADOS Y CORREGIDOS
-console.log('⏰ Iniciando cron jobs optimizados...');
-
-cron.schedule('*/2 * * * *', () => {
+ // Scheduler: ejecuta las secuencias activas cada 15 segundos
+ cron.schedule('*/30 * * * * *', () => {
   console.log('⏱️ processSequences:', new Date().toISOString());
-  processSequences().catch(err => console.error('❌ Error en processSequences:', err));
+  processSequences().catch(err => console.error('Error en processSequences:', err));
 });
 
-cron.schedule('*/3 * * * *', () => {
-  console.log('🎼 generarLetraParaMusica:', new Date().toISOString());
-  generarLetraParaMusica().catch(err => console.error('❌ Error en generarLetraParaMusica:', err));
-});
 
-cron.schedule('*/3 * * * *', () => {
-  console.log('💭 generarPromptParaMusica:', new Date().toISOString());
-  generarPromptParaMusica().catch(err => console.error('❌ Error en generarPromptParaMusica:', err));
-});
 
-cron.schedule('*/5 * * * *', () => {
-  console.log('🎵 generarMusicaConSuno:', new Date().toISOString());
-  generarMusicaConSuno().catch(err => console.error('❌ Error en generarMusicaConSuno:', err));
-});
-
-cron.schedule('*/5 * * * *', () => {
-  console.log('✂️ procesarClips:', new Date().toISOString());
-  procesarClips().catch(err => console.error('❌ Error en procesarClips:', err));
-});
-
-cron.schedule('*/3 * * * *', () => {
-  console.log('📱 enviarMusicaPorWhatsApp:', new Date().toISOString());
-  enviarMusicaPorWhatsApp().catch(err => console.error('❌ Error en enviarMusicaPorWhatsApp:', err));
-});
-
-cron.schedule('*/15 * * * *', () => {
-  console.log('🧹 limpiarDocumentosStuck:', new Date().toISOString());
-  limpiarDocumentosStuck().catch(err => console.error('❌ Error en limpiarDocumentosStuck:', err));
-});
-
-cron.schedule('*/10 * * * *', () => {
-  console.log('🔄 retryStuckMusic:', new Date().toISOString());
-  retryStuckMusic(20).catch(err => console.error('❌ Error en retryStuckMusic:', err));
-});
-
-console.log('✅ Todos los cron jobs iniciados correctamente');
+// Música
+cron.schedule('*/1 * * * *', generarLetraParaMusica);
+cron.schedule('*/1 * * * *', generarPromptParaMusica);
+cron.schedule('*/2 * * * *', generarMusicaConSuno);
+cron.schedule('*/2 * * * *', procesarClips);
+cron.schedule('*/1 * * * *', enviarMusicaPorWhatsApp);
+cron.schedule('*/5 * * * *', () => retryStuckMusic(10));
