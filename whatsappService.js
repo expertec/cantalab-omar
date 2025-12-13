@@ -4,7 +4,8 @@ import {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
-  downloadMediaMessage
+  downloadMediaMessage,
+  jidNormalizedUser
 } from 'baileys'; // Sin @whiskeysockets/
 import QRCode from 'qrcode-terminal';
 import Pino from 'pino';
@@ -12,6 +13,7 @@ import fs from 'fs';
 import path from 'path';
 import admin from 'firebase-admin';
 import { db } from './firebaseAdmin.js';
+import { computeSequenceStepRun } from './services/sequenceUtils.js';
 import axios from 'axios';      
 
 let latestQR = null;
@@ -22,6 +24,41 @@ let sessionPhone = null; // almacenará el número de la sesión activa
 const localAuthFolder = '/var/data';
 const { FieldValue } = admin.firestore;
 const bucket = admin.storage().bucket();
+const DEFAULT_COUNTRY_CODE = '52';
+
+function normalizeRemoteJid(jid) {
+  if (!jid) return '';
+  try {
+    return jidNormalizedUser(jid);
+  } catch {
+    return jid;
+  }
+}
+
+function normalizePhoneNumber(raw) {
+  if (!raw) return '';
+  let num = String(raw).replace(/\D/g, '');
+  if (!num) return '';
+  if (num.length === 10) {
+    num = `${DEFAULT_COUNTRY_CODE}${num}`;
+  }
+  return num;
+}
+
+export function buildJidFromPhone(rawPhone) {
+  const phone = normalizePhoneNumber(rawPhone);
+  if (!phone) {
+    throw new Error('Número de teléfono inválido');
+  }
+  return {
+    phone,
+    jid: normalizeRemoteJid(`${phone}@s.whatsapp.net`)
+  };
+}
+
+export function normalizeJid(jid) {
+  return normalizeRemoteJid(jid);
+}
 
 export async function connectToWhatsApp() {
   try {
@@ -34,7 +71,8 @@ export async function connectToWhatsApp() {
 
     // Extraer número de sesión
     if (state.creds.me?.id) {
-      sessionPhone = state.creds.me.id.split('@')[0];
+      const normalized = normalizeRemoteJid(state.creds.me.id);
+      sessionPhone = normalized.split('@')[0];
     }
 
     const { version } = await fetchLatestBaileysVersion();
@@ -57,7 +95,8 @@ export async function connectToWhatsApp() {
         connectionStatus = "Conectado";
         latestQR = null;
         if (sock.user?.id) {
-          sessionPhone = sock.user.id.split('@')[0];
+          const normalized = normalizeRemoteJid(sock.user.id);
+          sessionPhone = normalized.split('@')[0];
         }
       }
       if (connection === 'close') {
@@ -83,7 +122,7 @@ sock.ev.on('messages.upsert', async ({ messages, type }) => {
 
   for (const msg of messages) {
     if (!msg.key) continue;
-    const jid = msg.key.remoteJid;
+    const jid = normalizeRemoteJid(msg.key.remoteJid);
     if (!jid || jid.endsWith('@g.us')) continue; // ignorar grupos
 
     // 1) Determinar número de teléfono y quién envía
@@ -207,23 +246,27 @@ const nowIso = new Date().toISOString();
 
 if (!docSnap.exists) {
   // Si NO existe, creamos el lead nuevo con el JID como ID
-  await leadRef.set({
+  const initialSequence = {
+    trigger,
+    startTime: nowIso,
+    index: 0
+  };
+  const nextRunDate = await computeSequenceStepRun(trigger, nowIso, 0);
+  const leadPayload = {
     telefono: phone,
     nombre: msg.pushName || '',
     source: 'WhatsApp',
     fecha_creacion: new Date(),
     estado: 'nuevo',
     etiquetas: [trigger],
-    secuenciasActivas: [
-      {
-        trigger,
-        startTime: nowIso,
-        index: 0
-      }
-    ],
+    secuenciasActivas: [initialSequence],
     unreadCount: 0,
     lastMessageAt: new Date()
-  });
+  };
+  if (nextRunDate) {
+    leadPayload.nextSequenceRunAt = admin.firestore.Timestamp.fromDate(nextRunDate);
+  }
+  await leadRef.set(leadPayload);
 } else {
   // Si YA existe, actualizamos etiquetas, etc.
   await leadRef.update({
@@ -271,9 +314,7 @@ export async function sendFullAudioAsDocument(phone, fileUrl) {
   const sock = getWhatsAppSock();
   if (!sock) throw new Error('No hay conexión activa con WhatsApp');
 
-  let num = String(phone).replace(/\D/g, '');
-  if (num.length === 10) num = '52' + num;
-  const jid = `${num}@s.whatsapp.net`;
+  const { jid } = buildJidFromPhone(phone);
 
   // 1) Descargar el archivo
   let res;
@@ -308,10 +349,8 @@ export async function sendMessageToLead(phone, messageContent) {
     throw new Error('No hay conexión activa con WhatsApp');
   }
 
-  // 1) Normalizar número: quitar no dígitos y añadir prefijo MX si es 10 dígitos
-  let num = String(phone).replace(/\D/g, '');
-  if (num.length === 10) num = '52' + num;
-  const jid = `${num}@s.whatsapp.net`;
+  // 1) Normalizar número / JID
+  const { jid, phone: normalizedPhone } = buildJidFromPhone(phone);
 
   // 2) Enviar mensaje de texto sin link preview y con timeout extendido
   await whatsappSock.sendMessage(
@@ -328,7 +367,7 @@ export async function sendMessageToLead(phone, messageContent) {
   // 3) Guardar en Firestore bajo sender 'business'
   const q = await db
     .collection('leads')
-    .where('telefono', '==', num)
+    .where('telefono', '==', normalizedPhone)
     .limit(1)
     .get();
 
@@ -382,8 +421,7 @@ export async function sendAudioMessage(phone, filePath) {
   const sock = getWhatsAppSock();
   if (!sock) throw new Error('Socket de WhatsApp no está conectado');
 
-  const num = String(phone).replace(/\D/g, '');
-  const jid = `${num}@s.whatsapp.net`;
+  const { jid, phone: normalizedPhone } = buildJidFromPhone(phone);
 
   // 1) Leer y enviar por Baileys como audio/mp4
   const audioBuffer = fs.readFileSync(filePath);
@@ -395,7 +433,7 @@ export async function sendAudioMessage(phone, filePath) {
 
   // 2) Subir a Firebase Storage
   const bucket = admin.storage().bucket();
-  const dest   = `audios/${num}-${Date.now()}.m4a`;
+  const dest   = `audios/${normalizedPhone}-${Date.now()}.m4a`;
   const file   = bucket.file(dest);
   await file.save(audioBuffer, { contentType: 'audio/mp4' });
   const [mediaUrl] = await file.getSignedUrl({
@@ -405,7 +443,7 @@ export async function sendAudioMessage(phone, filePath) {
 
   // 3) Guardar en Firestore
   const q = await db.collection('leads')
-                    .where('telefono', '==', num)
+                    .where('telefono', '==', normalizedPhone)
                     .limit(1)
                     .get();
   if (!q.empty) {
@@ -438,9 +476,7 @@ export async function sendClipMessage(phone, clipUrl) {
   if (!sock) throw new Error('No hay conexión activa con WhatsApp');
 
   // 1) Normalizar teléfono → JID
-  let num = String(phone).replace(/\D/g, '');
-  if (num.length === 10) num = '52' + num;
-  const jid = `${num}@s.whatsapp.net`;
+  const { jid } = buildJidFromPhone(phone);
 
   // 2) Payload de audio directo desde URL
   const messagePayload = {

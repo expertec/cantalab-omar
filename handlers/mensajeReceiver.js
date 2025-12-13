@@ -1,4 +1,5 @@
 import { db } from '../firebaseAdmin.js'; // Asegúrate de tener Firebase Admin configurado
+import { normalizeJid } from '../whatsappService.js';
 
 /**
  * Función para manejar la recepción de mensajes y guardar la conversación en Firebase
@@ -6,7 +7,7 @@ import { db } from '../firebaseAdmin.js'; // Asegúrate de tener Firebase Admin 
  */
 export async function receiveMessage(message) {
   try {
-    const jid = message.key.remoteJid;
+    const jid = normalizeJid(message.key.remoteJid);
     const content = message.message?.conversation || message.message?.extendedTextMessage?.text;
 
     if (!content) {

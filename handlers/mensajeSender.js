@@ -1,4 +1,4 @@
-import { getWhatsAppSock } from '../whatsappService.js';
+import { getWhatsAppSock, buildJidFromPhone } from '../whatsappService.js';
 import { db } from '../firebaseAdmin.js';  // Asegúrate de tener Firebase Admin configurado
 
 /**
@@ -16,11 +16,7 @@ export async function sendMessage(leadId, message) {
     const telefono = leadData.telefono;
 
     // Formatear el número de teléfono
-    let number = telefono;
-    if (!number.startsWith('521')) {
-      number = `521${number}`;
-    }
-    const jid = `${number}@s.whatsapp.net`;
+    const { jid } = buildJidFromPhone(telefono);
 
     // Enviar mensaje a WhatsApp
     const sock = getWhatsAppSock();

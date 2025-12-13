@@ -1,6 +1,12 @@
 // src/server/scheduler.js
 import admin from 'firebase-admin';
-import { getWhatsAppSock } from './whatsappService.js';
+import {
+  getWhatsAppSock,
+  sendMessageToLead,
+  sendAudioMessage,
+  sendClipMessage,
+  buildJidFromPhone
+} from './whatsappService.js';
 import { db } from './firebaseAdmin.js';
 import { Configuration, OpenAIApi } from 'openai';
 
@@ -10,8 +16,11 @@ import path from 'path';
 import axios from 'axios';
 import ffmpeg from 'fluent-ffmpeg';
 // al inicio de src/server/scheduler.js (o donde esté tu enviarMusicaPorWhatsApp)
-import { sendMessageToLead, sendAudioMessage } from './whatsappService.js';
-import { sendClipMessage } from './whatsappService.js';
+import {
+  computeSequenceStepRun,
+  computeNextRunForLead,
+  getSequenceDefinition
+} from './services/sequenceUtils.js';
 
 
 
@@ -83,8 +92,7 @@ async function enviarMensaje(lead, mensaje) {
     const sock = getWhatsAppSock();
     if (!sock) return;
 
-    const phone = (lead.telefono || '').replace(/\D/g, '');
-    const jid = `${phone}@s.whatsapp.net`;
+    const { jid, phone } = buildJidFromPhone(lead.telefono || '');
 
     switch (mensaje.type) {
       case 'texto': {
@@ -134,60 +142,118 @@ async function enviarMensaje(lead, mensaje) {
 }
 
 
+async function updateLeadSequences(doc) {
+  const leadData = doc.data();
+  const leadId = doc.id;
+  const sequences = Array.isArray(leadData.secuenciasActivas)
+    ? leadData.secuenciasActivas.map(seq => ({ ...seq, index: seq.index || 0 }))
+    : [];
+  if (!sequences.length) {
+    await doc.ref.update({
+      secuenciasActivas: [],
+      nextSequenceRunAt: FieldValue.delete()
+    });
+    return;
+  }
+
+  const lead = { id: leadId, ...leadData };
+  let dirty = false;
+
+  for (const seq of sequences) {
+    const definition = await getSequenceDefinition(seq.trigger);
+    if (!definition || !Array.isArray(definition.messages)) {
+      seq.completed = true;
+      dirty = true;
+      continue;
+    }
+
+    if (seq.index >= definition.messages.length) {
+      seq.completed = true;
+      dirty = true;
+      continue;
+    }
+
+    const sendAt = await computeSequenceStepRun(seq.trigger, seq.startTime, seq.index);
+    if (!sendAt || Date.now() < sendAt.getTime()) continue;
+
+    const msg = definition.messages[seq.index];
+    await enviarMensaje(lead, msg);
+    await doc.ref
+      .collection('messages')
+      .add({
+        content: `Se envió el ${msg.type} de la secuencia ${seq.trigger}`,
+        sender: 'system',
+        timestamp: new Date()
+      });
+
+    seq.index += 1;
+    if (seq.index >= definition.messages.length) {
+      seq.completed = true;
+    }
+    dirty = true;
+  }
+
+  if (!dirty) return;
+
+  const remaining = sequences
+    .filter(s => !s.completed)
+    .map(({ trigger, startTime, index }) => ({
+      trigger,
+      startTime,
+      index: index || 0
+    }));
+  const nextRun = await computeNextRunForLead(remaining);
+  const updatePayload = {
+    secuenciasActivas: remaining
+  };
+  if (nextRun) {
+    updatePayload.nextSequenceRunAt = admin.firestore.Timestamp.fromDate(nextRun);
+  } else {
+    updatePayload.nextSequenceRunAt = FieldValue.delete();
+  }
+  await doc.ref.update(updatePayload);
+}
+
+async function hydrateNextSequenceRun(batchSize = 25) {
+  const snap = await db
+    .collection('leads')
+    .where('secuenciasActivas', '!=', null)
+    .limit(batchSize)
+    .get();
+
+  for (const doc of snap.docs) {
+    const data = doc.data();
+    if (!Array.isArray(data.secuenciasActivas) || !data.secuenciasActivas.length) continue;
+    if (data.nextSequenceRunAt) continue;
+
+    const nextRun = await computeNextRunForLead(data.secuenciasActivas);
+    if (!nextRun) continue;
+    await doc.ref.update({
+      nextSequenceRunAt: admin.firestore.Timestamp.fromDate(nextRun)
+    });
+  }
+}
+
 /**
- * Procesa las secuencias activas de cada lead.
+ * Procesa las secuencias activas consultando únicamente los leads con nextSequenceRunAt vencido.
  */
-async function processSequences() {
+async function processSequences(limit = 25) {
   try {
+    const now = admin.firestore.Timestamp.now();
     const leadsSnap = await db
       .collection('leads')
-      .where('secuenciasActivas', '!=', null)
+      .where('nextSequenceRunAt', '<=', now)
+      .orderBy('nextSequenceRunAt')
+      .limit(limit)
       .get();
 
+    if (leadsSnap.empty) {
+      await hydrateNextSequenceRun();
+      return;
+    }
+
     for (const doc of leadsSnap.docs) {
-      const lead = { id: doc.id, ...doc.data() };
-      if (!Array.isArray(lead.secuenciasActivas) || !lead.secuenciasActivas.length) continue;
-
-      let dirty = false;
-      for (const seq of lead.secuenciasActivas) {
-        const { trigger, startTime, index } = seq;
-        const seqSnap = await db
-          .collection('secuencias')
-          .where('trigger', '==', trigger)
-          .get();
-        if (seqSnap.empty) continue;
-
-        const msgs = seqSnap.docs[0].data().messages;
-        if (index >= msgs.length) {
-          seq.completed = true;
-          dirty = true;
-          continue;
-        }
-
-        const msg = msgs[index];
-        const sendAt = new Date(startTime).getTime() + msg.delay * 60000;
-        if (Date.now() < sendAt) continue;
-
-        // Enviar y luego registrar en Firestore
-        await enviarMensaje(lead, msg);
-        await db
-          .collection('leads')
-          .doc(lead.id)
-          .collection('messages')
-          .add({
-            content: `Se envió el ${msg.type} de la secuencia ${trigger}`,
-            sender: 'system',
-            timestamp: new Date()
-          });
-
-        seq.index++;
-        dirty = true;
-      }
-
-      if (dirty) {
-        const rem = lead.secuenciasActivas.filter(s => !s.completed);
-        await db.collection('leads').doc(lead.id).update({ secuenciasActivas: rem });
-      }
+      await updateLeadSequences(doc);
     }
   } catch (err) {
     console.error("Error en processSequences:", err);
@@ -438,14 +504,30 @@ async function enviarMusicaPorWhatsApp() {
         sentAt: FieldValue.serverTimestamp()
       });
 
-      // 5) (Opcional) Disparar siguiente secuencia
-      await db.collection('leads').doc(leadId).update({
-        secuenciasActivas: FieldValue.arrayUnion({
+      // 5) (Opcional) Disparar siguiente secuencia y actualizar nextSequenceRunAt
+      const leadRef = db.collection('leads').doc(leadId);
+      const freshLeadSnap = await leadRef.get();
+      if (freshLeadSnap.exists) {
+        const sequences = Array.isArray(freshLeadSnap.data().secuenciasActivas)
+          ? [...freshLeadSnap.data().secuenciasActivas]
+          : [];
+        const newSeq = {
           trigger: 'CancionEnviada',
           startTime: new Date().toISOString(),
           index: 0
-        })
-      });
+        };
+        sequences.push(newSeq);
+        const nextRun = await computeNextRunForLead(sequences);
+        const updatePayload = {
+          secuenciasActivas: sequences
+        };
+        if (nextRun) {
+          updatePayload.nextSequenceRunAt = admin.firestore.Timestamp.fromDate(nextRun);
+        } else {
+          updatePayload.nextSequenceRunAt = FieldValue.delete();
+        }
+        await leadRef.update(updatePayload);
+      }
 
       console.log(`✅ Música enviada a ${leadPhone} (doc ${doc.id})`);
     } catch (err) {
@@ -489,4 +571,3 @@ export {
   enviarMusicaPorWhatsApp,
   retryStuckMusic
 };
-
