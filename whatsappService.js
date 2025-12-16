@@ -13,7 +13,10 @@ import fs from 'fs';
 import path from 'path';
 import admin from 'firebase-admin';
 import { db } from './firebaseAdmin.js';
-import { computeSequenceStepRun } from './services/sequenceUtils.js';
+import {
+  computeSequenceStepRun,
+  computeNextRunForLead
+} from './services/sequenceUtils.js';
 import axios from 'axios';      
 
 let latestQR = null;
@@ -127,7 +130,8 @@ sock.ev.on('messages.upsert', async ({ messages, type }) => {
 
     // 1) Determinar número de teléfono y quién envía
     const phone = jid.split('@')[0];
-    const sender = msg.key.fromMe ? 'business' : 'lead';
+    const isBusinessMessage = Boolean(msg.key?.fromMe);
+    const sender = isBusinessMessage ? 'business' : 'lead';
 
     // 2) Inicializar variables para contenido y tipo de media
     let content = '';
@@ -235,9 +239,12 @@ const docSnap = await leadRef.get();
 const cfgSnap = await db.collection('config').doc('appConfig').get();
 const cfg = cfgSnap.exists ? cfgSnap.data() : {};
 
+const normalizedContent = (content || '').toLowerCase();
+const manualLinkRequested = isBusinessMessage && normalizedContent.includes('#link');
+
 // Detectamos si el mensaje incluye "#webPro1490"
 let trigger;
-if (content.includes('#webPro1490')) {
+if (normalizedContent.includes('#webpro1490')) {
   trigger = 'LeadWeb1490';
 } else {
   trigger = cfg.defaultTrigger || 'NuevoLead';
@@ -268,11 +275,42 @@ if (!docSnap.exists) {
   }
   await leadRef.set(leadPayload);
 } else {
-  // Si YA existe, actualizamos etiquetas, etc.
-  await leadRef.update({
-    etiquetas: admin.firestore.FieldValue.arrayUnion(trigger),
+  // Si YA existe, aseguramos que tenga la secuencia activa correspondiente
+  const leadData = docSnap.data() || {};
+  const updatePayload = {
+    etiquetas: FieldValue.arrayUnion(trigger),
     lastMessageAt: new Date()
-  });
+  };
+
+  let existingSequences = Array.isArray(leadData.secuenciasActivas)
+    ? [...leadData.secuenciasActivas]
+    : [];
+
+  if (manualLinkRequested) {
+    // Fuerza reinicio de la secuencia eliminando instancias anteriores del trigger.
+    existingSequences = existingSequences.filter(seq => seq.trigger !== trigger);
+  }
+
+  const hasSameTrigger = existingSequences.some(seq => seq.trigger === trigger);
+
+  if (!hasSameTrigger || manualLinkRequested) {
+    const newSequence = {
+      trigger,
+      startTime: nowIso,
+      index: 0
+    };
+    existingSequences.push(newSequence);
+    updatePayload.secuenciasActivas = existingSequences;
+
+    const nextRunDate = await computeNextRunForLead(existingSequences);
+    if (nextRunDate) {
+      updatePayload.nextSequenceRunAt = admin.firestore.Timestamp.fromDate(nextRunDate);
+    } else {
+      updatePayload.nextSequenceRunAt = FieldValue.delete();
+    }
+  }
+
+  await leadRef.update(updatePayload);
 }
 
 const leadId = jid;
@@ -295,7 +333,7 @@ const leadId = jid;
     // 6) ACTUALIZAR el lead: incrementar unreadCount si envió el lead
     const updateData = { lastMessageAt: msgData.timestamp };
     if (sender === 'lead') {
-      updateData.unreadCount = admin.firestore.FieldValue.increment(1);
+      updateData.unreadCount = FieldValue.increment(1);
     }
     await db.collection('leads').doc(leadId).update(updateData);
   }
