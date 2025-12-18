@@ -253,7 +253,31 @@ async function processSequences(limit = 25) {
     }
 
     for (const doc of leadsSnap.docs) {
-      await updateLeadSequences(doc);
+      // Adquirir lock ligero para evitar envíos duplicados cuando hay múltiples instancias/cron solapados
+      const lockedSnap = await db.runTransaction(async tx => {
+        const snap = await tx.get(doc.ref);
+        const data = snap.data() || {};
+        const lockTs = data.sequenceLock?.toDate
+          ? data.sequenceLock.toDate()
+          : null;
+
+        // Si otro proceso tomó el lock hace <2 min, saltamos
+        if (lockTs && Date.now() - lockTs.getTime() < 2 * 60_000) {
+          return null;
+        }
+
+        tx.update(doc.ref, { sequenceLock: admin.firestore.Timestamp.now() });
+        return snap;
+      });
+
+      if (!lockedSnap) continue;
+
+      try {
+        await updateLeadSequences(lockedSnap);
+      } finally {
+        // Liberar lock
+        await doc.ref.update({ sequenceLock: FieldValue.delete() });
+      }
     }
   } catch (err) {
     console.error("Error en processSequences:", err);
