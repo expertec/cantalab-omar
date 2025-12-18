@@ -22,6 +22,16 @@ import {
   getSequenceDefinition
 } from './services/sequenceUtils.js';
 
+// Convierte Timestamp/Date/string/number a Date o null
+function toDateSafe(value) {
+  if (!value) return null;
+  if (value instanceof Date) return value;
+  if (typeof value?.toDate === 'function') {
+    try { return value.toDate(); } catch { return null; }
+  }
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
 
 
 
@@ -148,10 +158,14 @@ async function updateLeadSequences(doc) {
   const sequences = Array.isArray(leadData.secuenciasActivas)
     ? leadData.secuenciasActivas.map(seq => ({ ...seq, index: seq.index || 0 }))
     : [];
+  const sentSteps = typeof leadData.sequenceSentSteps === 'object' && leadData.sequenceSentSteps
+    ? { ...leadData.sequenceSentSteps }
+    : {};
   if (!sequences.length) {
     await doc.ref.update({
       secuenciasActivas: [],
-      nextSequenceRunAt: FieldValue.delete()
+      nextSequenceRunAt: FieldValue.delete(),
+      sequenceSentSteps: FieldValue.delete()
     });
     return;
   }
@@ -173,6 +187,19 @@ async function updateLeadSequences(doc) {
       continue;
     }
 
+    // Idempotencia por paso (trigger:index)
+    const stepKey = `${seq.trigger}:${seq.index}`;
+    const alreadySentAt = toDateSafe(sentSteps[stepKey]);
+    if (alreadySentAt) {
+      // Ya se envió este paso antes: avanzamos índice sin reenviar
+      seq.index += 1;
+      if (seq.index >= definition.messages.length) {
+        seq.completed = true;
+      }
+      dirty = true;
+      continue;
+    }
+
     const sendAt = await computeSequenceStepRun(seq.trigger, seq.startTime, seq.index);
     if (!sendAt || Date.now() < sendAt.getTime()) continue;
 
@@ -185,6 +212,9 @@ async function updateLeadSequences(doc) {
         sender: 'system',
         timestamp: new Date()
       });
+
+    // Marcar paso como enviado para no repetirlo
+    sentSteps[stepKey] = admin.firestore.Timestamp.now();
 
     seq.index += 1;
     if (seq.index >= definition.messages.length) {
@@ -204,7 +234,8 @@ async function updateLeadSequences(doc) {
     }));
   const nextRun = await computeNextRunForLead(remaining);
   const updatePayload = {
-    secuenciasActivas: remaining
+    secuenciasActivas: remaining,
+    sequenceSentSteps: sentSteps
   };
   if (nextRun) {
     updatePayload.nextSequenceRunAt = admin.firestore.Timestamp.fromDate(nextRun);
