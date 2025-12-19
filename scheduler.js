@@ -22,6 +22,71 @@ import {
   getSequenceDefinition
 } from './services/sequenceUtils.js';
 
+/**
+ * Activa (o fuerza) una secuencia para un lead. Útil cuando no se activó al crearlo.
+ * @param {string} leadId       ID del documento en /leads
+ * @param {string} trigger      Trigger de la secuencia (default: 'NuevoLead')
+ */
+async function activateSequenceForLead(leadId, trigger = 'NuevoLead') {
+  if (!leadId) throw new Error('Falta leadId');
+  const ref = db.collection('leads').doc(leadId);
+  const snap = await ref.get();
+  if (!snap.exists) throw new Error('Lead no encontrado');
+
+  const data = snap.data() || {};
+  const nowIso = new Date().toISOString();
+  const sequences = Array.isArray(data.secuenciasActivas) ? [...data.secuenciasActivas] : [];
+
+  const hasTrigger = sequences.some(seq => seq.trigger === trigger);
+  if (!hasTrigger) {
+    sequences.push({ trigger, startTime: nowIso, index: 0 });
+  }
+
+  const nextRun = await computeNextRunForLead(sequences);
+  const update = {
+    secuenciasActivas: sequences,
+    etiquetas: FieldValue.arrayUnion(trigger)
+  };
+  if (nextRun) {
+    update.nextSequenceRunAt = admin.firestore.Timestamp.fromDate(nextRun);
+  } else {
+    update.nextSequenceRunAt = FieldValue.delete();
+  }
+
+  await ref.update(update);
+  return { success: true, nextRunAt: nextRun || null, sequences: sequences.length };
+}
+
+/**
+ * Activa en lote la secuencia por defecto para leads que NO tienen secuenciasActivas (null).
+ * Útil para rescatar leads creados por campañas externas (p.ej. Facebook Ads) sin secuencias.
+ */
+async function backfillMissingSequences({ trigger = 'NuevoLead', source, batchSize = 50 } = {}) {
+  let query = db.collection('leads').where('secuenciasActivas', '==', null).limit(batchSize);
+  if (source) {
+    query = query.where('source', '==', source);
+  }
+  const snap = await query.get();
+  if (snap.empty) return { updated: 0 };
+
+  let updated = 0;
+  for (const doc of snap.docs) {
+    const nowIso = new Date().toISOString();
+    const sequences = [{ trigger, startTime: nowIso, index: 0 }];
+    const nextRun = await computeNextRunForLead(sequences);
+    const update = {
+      secuenciasActivas: sequences,
+      etiquetas: FieldValue.arrayUnion(trigger)
+    };
+    if (nextRun) {
+      update.nextSequenceRunAt = admin.firestore.Timestamp.fromDate(nextRun);
+    }
+    await doc.ref.update(update);
+    updated += 1;
+  }
+  return { updated };
+}
+
 // Convierte Timestamp/Date/string/number a Date o null
 function toDateSafe(value) {
   if (!value) return null;
@@ -624,5 +689,7 @@ export {
   generarMusicaConSuno,
   procesarClips,
   enviarMusicaPorWhatsApp,
-  retryStuckMusic
+  retryStuckMusic,
+  activateSequenceForLead,
+  backfillMissingSequences
 };

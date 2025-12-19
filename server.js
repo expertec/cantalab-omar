@@ -47,7 +47,9 @@ import {
   generarMusicaConSuno,
   procesarClips,
   enviarMusicaPorWhatsApp,
-  retryStuckMusic
+  retryStuckMusic,
+  activateSequenceForLead,
+  backfillMissingSequences
 } from './scheduler.js';
 
 
@@ -372,6 +374,32 @@ app.listen(port, () => {
 
 
   
+});
+
+// Activar secuencia para un lead (por ejemplo, NuevoLead) si no se activó
+app.post('/api/sequences/activate-nuevo-lead', async (req, res) => {
+  const { leadId, trigger } = req.body || {};
+  if (!leadId) return res.status(400).json({ error: 'Falta leadId' });
+  const trig = trigger || 'NuevoLead';
+  try {
+    const result = await activateSequenceForLead(leadId, trig);
+    return res.json(result);
+  } catch (err) {
+    console.error('Error activando secuencia:', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Backfill: activar secuencias por defecto en leads sin secuenciasActivas (p.ej. campañas FB)
+app.post('/api/sequences/backfill', async (req, res) => {
+  const { trigger, source, batchSize } = req.body || {};
+  try {
+    const result = await backfillMissingSequences({ trigger, source, batchSize });
+    return res.json(result);
+  } catch (err) {
+    console.error('Error en backfill:', err);
+    return res.status(500).json({ error: err.message });
+  }
 });
 
  // Scheduler: ejecuta las secuencias activas cada 15 segundos
