@@ -5,7 +5,8 @@ import {
   sendMessageToLead,
   sendAudioMessage,
   sendClipMessage,
-  buildJidFromPhone
+  buildJidFromPhone,
+  normalizeJid
 } from './whatsappService.js';
 import { db } from './firebaseAdmin.js';
 import { Configuration, OpenAIApi } from 'openai';
@@ -129,6 +130,31 @@ function replacePlaceholders(template, leadData) {
   });
 }
 
+/**
+ * Devuelve el JID correcto para enviar mensajes. Si el documento ya es un JID
+ * (ej. termina en @s.whatsapp.net o @lid), lo usamos para conservar el dominio,
+ * de lo contrario construimos el JID a partir del teléfono.
+ */
+function resolveLeadJidAndPhone(lead) {
+  // 1) Si el lead guarda un JID explícito (ej. @lid), úsalo
+  if (typeof lead.jid === 'string' && lead.jid.includes('@')) {
+    const jid = normalizeJid(lead.jid);
+    const phone = jid.split('@')[0].split(':')[0];
+    return { jid, phone };
+  }
+
+  // 2) Caso habitual: el doc.id ya es JID
+  const rawId = typeof lead.id === 'string' ? lead.id : '';
+  if (rawId.includes('@')) {
+    const jid = normalizeJid(rawId);
+    const phone = jid.split('@')[0].split(':')[0]; // quitar posibles deviceId/lid extras
+    return { jid, phone };
+  }
+
+  // 3) Fallback a teléfono guardado
+  return buildJidFromPhone(lead.telefono || '');
+}
+
 
 async function downloadStream(url, destPath) {
   const res = await axios.get(url, { responseType: 'stream' });
@@ -167,7 +193,7 @@ async function enviarMensaje(lead, mensaje) {
     const sock = getWhatsAppSock();
     if (!sock) return;
 
-    const { jid, phone } = buildJidFromPhone(lead.telefono || '');
+    const { jid, phone } = resolveLeadJidAndPhone(lead);
 
     switch (mensaje.type) {
       case 'texto': {

@@ -251,12 +251,12 @@ if (normalizedContent.includes('#webpro1490')) {
 }
 const nowIso = new Date().toISOString();
 
-if (!docSnap.exists) {
-  // Si NO existe, creamos el lead nuevo con el JID como ID
-  const initialSequence = {
-    trigger,
-    startTime: nowIso,
-    index: 0
+  if (!docSnap.exists) {
+    // Si NO existe, creamos el lead nuevo con el JID como ID
+    const initialSequence = {
+      trigger,
+      startTime: nowIso,
+      index: 0
   };
   const nextRunDate = await computeSequenceStepRun(trigger, nowIso, 0);
   const leadPayload = {
@@ -266,6 +266,7 @@ if (!docSnap.exists) {
     fecha_creacion: new Date(),
     estado: 'nuevo',
     etiquetas: [trigger],
+    jid, // guardamos el JID exacto que recibimos (incluye @lid si aplica)
     secuenciasActivas: [initialSequence],
     unreadCount: 0,
     lastMessageAt: new Date()
@@ -279,7 +280,8 @@ if (!docSnap.exists) {
   const leadData = docSnap.data() || {};
   const updatePayload = {
     etiquetas: FieldValue.arrayUnion(trigger),
-    lastMessageAt: new Date()
+    lastMessageAt: new Date(),
+    jid // mantenemos el JID más reciente (útil para @lid)
   };
 
   let existingSequences = Array.isArray(leadData.secuenciasActivas)
