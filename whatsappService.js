@@ -38,6 +38,13 @@ function normalizeRemoteJid(jid) {
   }
 }
 
+export function phoneFromJid(jid) {
+  if (!jid) return '';
+  const normalized = normalizeRemoteJid(jid);
+  const user = normalized.split('@')[0] || '';
+  return user.split(':')[0].replace(/\D/g, '');
+}
+
 function normalizePhoneNumber(raw) {
   if (!raw) return '';
   let num = String(raw).replace(/\D/g, '');
@@ -61,6 +68,17 @@ export function buildJidFromPhone(rawPhone) {
 
 export function normalizeJid(jid) {
   return normalizeRemoteJid(jid);
+}
+
+export function extractJidFromLead(lead) {
+  if (!lead) return null;
+  const candidates = [lead.resolvedJid, lead.jid, lead.id];
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.includes('@')) {
+      return normalizeRemoteJid(candidate);
+    }
+  }
+  return null;
 }
 
 export async function connectToWhatsApp() {
@@ -117,229 +135,220 @@ export async function connectToWhatsApp() {
 
     sock.ev.on('creds.update', saveCreds);
 
-    // Dentro de whatsappService.js, ubica tu sección donde tienes:
-// sock.ev.on('messages.upsert', async ({ messages, type }) => { … });
+    // Manejo de mensajes entrantes
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify') return;
 
-sock.ev.on('messages.upsert', async ({ messages, type }) => {
-  if (type !== 'notify') return;
+      for (const msg of messages) {
+        if (!msg.key) continue;
+        const remoteJid = normalizeRemoteJid(msg.key.remoteJid);
+        const remoteJidAlt = msg?.key?.remoteJidAlt
+          ? normalizeRemoteJid(msg.key.remoteJidAlt)
+          : null;
+        const resolvedJid = remoteJidAlt || remoteJid;
+        const addressingMode = msg?.key?.addressingMode || 'pn';
+        const isLidRemote = addressingMode === 'lid' || remoteJid.endsWith('@lid');
 
-  for (const msg of messages) {
-    if (!msg.key) continue;
-    const jid = normalizeRemoteJid(msg.key.remoteJid);
-    if (!jid || jid.endsWith('@g.us')) continue; // ignorar grupos
+        if (!resolvedJid || resolvedJid.endsWith('@g.us')) continue; // ignorar grupos
+        const phone = phoneFromJid(remoteJidAlt || remoteJid);
+        if (remoteJidAlt) {
+          console.log('[WA] ✅ Usando remoteJidAlt (número real):', remoteJidAlt);
+        }
 
-    // 1) Determinar número de teléfono y quién envía
-    const phone = jid.split('@')[0];
-    const isBusinessMessage = Boolean(msg.key?.fromMe);
-    const sender = isBusinessMessage ? 'business' : 'lead';
+        const isBusinessMessage = Boolean(msg.key?.fromMe);
+        const sender = isBusinessMessage ? 'business' : 'lead';
 
-    // 2) Inicializar variables para contenido y tipo de media
-    let content = '';
-    let mediaType = null;
-    let mediaUrl = null;
+        let content = '';
+        let mediaType = null;
+        let mediaUrl = null;
 
-    // 3) Procesar distintos tipos de mensaje
-    try {
-      // 3.1) Video
-      if (msg.message.videoMessage) {
-        mediaType = 'video';
-        const buffer = await downloadMediaMessage(
-          msg,
-          'buffer',
-          {},
-          { logger: Pino() }
-        );
-        const fileName = `videos/${phone}-${Date.now()}.mp4`;
-        const fileRef = admin.storage().bucket().file(fileName);
-        await fileRef.save(buffer, { contentType: 'video/mp4' });
-        const [url] = await fileRef.getSignedUrl({
-          action: 'read',
-          expires: '03-01-2500'
-        });
-        mediaUrl = url;
+        try {
+          if (msg.message.videoMessage) {
+            mediaType = 'video';
+            const buffer = await downloadMediaMessage(
+              msg,
+              'buffer',
+              {},
+              { logger: Pino() }
+            );
+            const fileName = `videos/${phone}-${Date.now()}.mp4`;
+            const fileRef = admin.storage().bucket().file(fileName);
+            await fileRef.save(buffer, { contentType: 'video/mp4' });
+            const [url] = await fileRef.getSignedUrl({
+              action: 'read',
+              expires: '03-01-2500'
+            });
+            mediaUrl = url;
+          } else if (msg.message.imageMessage) {
+            mediaType = 'image';
+            const buffer = await downloadMediaMessage(
+              msg,
+              'buffer',
+              {},
+              { logger: Pino() }
+            );
+            const fileName = `images/${phone}-${Date.now()}.jpg`;
+            const fileRef = admin.storage().bucket().file(fileName);
+            await fileRef.save(buffer, { contentType: 'image/jpeg' });
+            const [url] = await fileRef.getSignedUrl({
+              action: 'read',
+              expires: '03-01-2500'
+            });
+            mediaUrl = url;
+          } else if (msg.message.audioMessage) {
+            mediaType = 'audio';
+            const buffer = await downloadMediaMessage(
+              msg,
+              'buffer',
+              {},
+              { logger: Pino() }
+            );
+            const fileName = `audios/${phone}-${Date.now()}.ogg`;
+            const fileRef = admin.storage().bucket().file(fileName);
+            await fileRef.save(buffer, { contentType: 'audio/ogg' });
+            const [url] = await fileRef.getSignedUrl({
+              action: 'read',
+              expires: '03-01-2500'
+            });
+            mediaUrl = url;
+          } else if (msg.message.documentMessage) {
+            mediaType = 'document';
+            const { mimetype, fileName: origName } = msg.message.documentMessage;
+            const buffer = await downloadMediaMessage(
+              msg,
+              'buffer',
+              {},
+              { logger: Pino() }
+            );
+            const ext = path.extname(origName) || '';
+            const fileName = `docs/${phone}-${Date.now()}${ext}`;
+            const fileRef = admin.storage().bucket().file(fileName);
+            await fileRef.save(buffer, { contentType: mimetype });
+            const [url] = await fileRef.getSignedUrl({
+              action: 'read',
+              expires: '03-01-2500'
+            });
+            mediaUrl = url;
+          } else if (msg.message.conversation) {
+            content = msg.message.conversation.trim();
+            mediaType = 'text';
+          } else if (msg.message.extendedTextMessage?.text) {
+            content = msg.message.extendedTextMessage.text.trim();
+            mediaType = 'text';
+          } else {
+            continue;
+          }
+        } catch (err) {
+          console.error('Error descargando/guardando media:', err);
+          continue;
+        }
+
+        const leadRef = db.collection('leads').doc(resolvedJid);
+        const docSnap = await leadRef.get();
+
+        const cfgSnap = await db.collection('config').doc('appConfig').get();
+        const cfg = cfgSnap.exists ? cfgSnap.data() : {};
+
+        const normalizedContent = (content || '').toLowerCase();
+        const manualLinkRequested = isBusinessMessage && normalizedContent.includes('#link');
+
+        let trigger;
+        if (normalizedContent.includes('#webpro1490')) {
+          trigger = 'LeadWeb1490';
+        } else {
+          trigger = cfg.defaultTrigger || 'NuevoLead';
+        }
+        const nowIso = new Date().toISOString();
+
+        if (!docSnap.exists) {
+          const initialSequence = {
+            trigger,
+            startTime: nowIso,
+            index: 0
+          };
+          const nextRunDate = await computeSequenceStepRun(trigger, nowIso, 0);
+          const leadPayload = {
+            telefono: phone,
+            nombre: msg.pushName || '',
+            source: 'WhatsApp',
+            fecha_creacion: new Date(),
+            estado: 'nuevo',
+            etiquetas: [trigger],
+            jid: remoteJid,
+            resolvedJid: remoteJidAlt || null,
+            lidJid: isLidRemote ? remoteJid : null,
+            addressingMode,
+            secuenciasActivas: [initialSequence],
+            unreadCount: 0,
+            lastMessageAt: new Date()
+          };
+          if (nextRunDate) {
+            leadPayload.nextSequenceRunAt = admin.firestore.Timestamp.fromDate(nextRunDate);
+          }
+          await leadRef.set(leadPayload);
+        } else {
+          const leadData = docSnap.data() || {};
+          const updatePayload = {
+            etiquetas: FieldValue.arrayUnion(trigger),
+            lastMessageAt: new Date(),
+            jid: remoteJid,
+            resolvedJid: remoteJidAlt || leadData.resolvedJid || null,
+            lidJid: isLidRemote ? remoteJid : (leadData.lidJid || null),
+            addressingMode
+          };
+
+          let existingSequences = Array.isArray(leadData.secuenciasActivas)
+            ? [...leadData.secuenciasActivas]
+            : [];
+
+          if (manualLinkRequested) {
+            existingSequences = existingSequences.filter(seq => seq.trigger !== trigger);
+          }
+
+          const hasSameTrigger = existingSequences.some(seq => seq.trigger === trigger);
+
+          if (!hasSameTrigger || manualLinkRequested) {
+            const newSequence = {
+              trigger,
+              startTime: nowIso,
+              index: 0
+            };
+            existingSequences.push(newSequence);
+            updatePayload.secuenciasActivas = existingSequences;
+
+            const nextRunDate = await computeNextRunForLead(existingSequences);
+            if (nextRunDate) {
+              updatePayload.nextSequenceRunAt = admin.firestore.Timestamp.fromDate(nextRunDate);
+            } else {
+              updatePayload.nextSequenceRunAt = FieldValue.delete();
+            }
+          }
+
+          await leadRef.update(updatePayload);
+        }
+
+        const leadId = resolvedJid;
+
+        const msgData = {
+          content,
+          mediaType,
+          mediaUrl,
+          sender,
+          timestamp: new Date()
+        };
+        await db
+          .collection('leads')
+          .doc(leadId)
+          .collection('messages')
+          .add(msgData);
+
+        const updateData = { lastMessageAt: msgData.timestamp };
+        if (sender === 'lead') {
+          updateData.unreadCount = FieldValue.increment(1);
+        }
+        await db.collection('leads').doc(leadId).update(updateData);
       }
-      // 3.2) Imagen
-      else if (msg.message.imageMessage) {
-        mediaType = 'image';
-        const buffer = await downloadMediaMessage(
-          msg,
-          'buffer',
-          {},
-          { logger: Pino() }
-        );
-        const fileName = `images/${phone}-${Date.now()}.jpg`;
-        const fileRef = admin.storage().bucket().file(fileName);
-        await fileRef.save(buffer, { contentType: 'image/jpeg' });
-        const [url] = await fileRef.getSignedUrl({
-          action: 'read',
-          expires: '03-01-2500'
-        });
-        mediaUrl = url;
-      }
-      // 3.3) Audio
-      else if (msg.message.audioMessage) {
-        mediaType = 'audio';
-        const buffer = await downloadMediaMessage(
-          msg,
-          'buffer',
-          {},
-          { logger: Pino() }
-        );
-        const fileName = `audios/${phone}-${Date.now()}.ogg`;
-        const fileRef = admin.storage().bucket().file(fileName);
-        await fileRef.save(buffer, { contentType: 'audio/ogg' });
-        const [url] = await fileRef.getSignedUrl({
-          action: 'read',
-          expires: '03-01-2500'
-        });
-        mediaUrl = url;
-      }
-      // 3.4) Documento
-      else if (msg.message.documentMessage) {
-        mediaType = 'document';
-        const { mimetype, fileName: origName } = msg.message.documentMessage;
-        const buffer = await downloadMediaMessage(
-          msg,
-          'buffer',
-          {},
-          { logger: Pino() }
-        );
-        const ext = path.extname(origName) || '';
-        const fileName = `docs/${phone}-${Date.now()}${ext}`;
-        const fileRef = admin.storage().bucket().file(fileName);
-        await fileRef.save(buffer, { contentType: mimetype });
-        const [url] = await fileRef.getSignedUrl({
-          action: 'read',
-          expires: '03-01-2500'
-        });
-        mediaUrl = url;
-      }
-      // 3.5) Texto o extendedTextMessage
-      else if (msg.message.conversation) {
-        content = msg.message.conversation.trim();
-        mediaType = 'text';
-      } else if (msg.message.extendedTextMessage?.text) {
-        content = msg.message.extendedTextMessage.text.trim();
-        mediaType = 'text';
-      } else {
-        // Cualquier otro tipo, lo ignoramos por ahora
-        continue;
-      }
-    } catch (err) {
-      console.error('Error descargando/guardando media:', err);
-      continue; // saltar este mensaje si falla descarga
-    }
-
-    // 4) BUSCAR O CREAR EL LEAD en Firestore usando JID como ID
-
-const leadRef = db.collection('leads').doc(jid);
-const docSnap = await leadRef.get();
-
-// Leemos configuración para defaultTrigger (solo una vez)
-const cfgSnap = await db.collection('config').doc('appConfig').get();
-const cfg = cfgSnap.exists ? cfgSnap.data() : {};
-
-const normalizedContent = (content || '').toLowerCase();
-const manualLinkRequested = isBusinessMessage && normalizedContent.includes('#link');
-
-// Detectamos si el mensaje incluye "#webPro1490"
-let trigger;
-if (normalizedContent.includes('#webpro1490')) {
-  trigger = 'LeadWeb1490';
-} else {
-  trigger = cfg.defaultTrigger || 'NuevoLead';
-}
-const nowIso = new Date().toISOString();
-
-  if (!docSnap.exists) {
-    // Si NO existe, creamos el lead nuevo con el JID como ID
-    const initialSequence = {
-      trigger,
-      startTime: nowIso,
-      index: 0
-  };
-  const nextRunDate = await computeSequenceStepRun(trigger, nowIso, 0);
-  const leadPayload = {
-    telefono: phone,
-    nombre: msg.pushName || '',
-    source: 'WhatsApp',
-    fecha_creacion: new Date(),
-    estado: 'nuevo',
-    etiquetas: [trigger],
-    jid, // guardamos el JID exacto que recibimos (incluye @lid si aplica)
-    secuenciasActivas: [initialSequence],
-    unreadCount: 0,
-    lastMessageAt: new Date()
-  };
-  if (nextRunDate) {
-    leadPayload.nextSequenceRunAt = admin.firestore.Timestamp.fromDate(nextRunDate);
-  }
-  await leadRef.set(leadPayload);
-} else {
-  // Si YA existe, aseguramos que tenga la secuencia activa correspondiente
-  const leadData = docSnap.data() || {};
-  const updatePayload = {
-    etiquetas: FieldValue.arrayUnion(trigger),
-    lastMessageAt: new Date(),
-    jid // mantenemos el JID más reciente (útil para @lid)
-  };
-
-  let existingSequences = Array.isArray(leadData.secuenciasActivas)
-    ? [...leadData.secuenciasActivas]
-    : [];
-
-  if (manualLinkRequested) {
-    // Fuerza reinicio de la secuencia eliminando instancias anteriores del trigger.
-    existingSequences = existingSequences.filter(seq => seq.trigger !== trigger);
-  }
-
-  const hasSameTrigger = existingSequences.some(seq => seq.trigger === trigger);
-
-  if (!hasSameTrigger || manualLinkRequested) {
-    const newSequence = {
-      trigger,
-      startTime: nowIso,
-      index: 0
-    };
-    existingSequences.push(newSequence);
-    updatePayload.secuenciasActivas = existingSequences;
-
-    const nextRunDate = await computeNextRunForLead(existingSequences);
-    if (nextRunDate) {
-      updatePayload.nextSequenceRunAt = admin.firestore.Timestamp.fromDate(nextRunDate);
-    } else {
-      updatePayload.nextSequenceRunAt = FieldValue.delete();
-    }
-  }
-
-  await leadRef.update(updatePayload);
-}
-
-const leadId = jid;
-
-
-    // 5) GUARDAR el mensaje dentro de /leads/{leadId}/messages
-    const msgData = {
-      content,
-      mediaType,
-      mediaUrl,
-      sender,
-      timestamp: new Date()
-    };
-    await db
-      .collection('leads')
-      .doc(leadId)
-      .collection('messages')
-      .add(msgData);
-
-    // 6) ACTUALIZAR el lead: incrementar unreadCount si envió el lead
-    const updateData = { lastMessageAt: msgData.timestamp };
-    if (sender === 'lead') {
-      updateData.unreadCount = FieldValue.increment(1);
-    }
-    await db.collection('leads').doc(leadId).update(updateData);
-  }
-});
+    });
 
     
 

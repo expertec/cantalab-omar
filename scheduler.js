@@ -6,7 +6,8 @@ import {
   sendAudioMessage,
   sendClipMessage,
   buildJidFromPhone,
-  normalizeJid
+  extractJidFromLead,
+  phoneFromJid
 } from './whatsappService.js';
 import { db } from './firebaseAdmin.js';
 import { Configuration, OpenAIApi } from 'openai';
@@ -131,28 +132,25 @@ function replacePlaceholders(template, leadData) {
 }
 
 /**
- * Devuelve el JID correcto para enviar mensajes. Si el documento ya es un JID
- * (ej. termina en @s.whatsapp.net o @lid), lo usamos para conservar el dominio,
- * de lo contrario construimos el JID a partir del teléfono.
+ * Devuelve el JID correcto para enviar mensajes. Prioriza resolvedJid > jid > id
+ * y solo recurre al teléfono si no hay ningún JID almacenado.
  */
 function resolveLeadJidAndPhone(lead) {
-  // 1) Si el lead guarda un JID explícito (ej. @lid), úsalo
-  if (typeof lead.jid === 'string' && lead.jid.includes('@')) {
-    const jid = normalizeJid(lead.jid);
-    const phone = jid.split('@')[0].split(':')[0];
+  const jid = extractJidFromLead(lead);
+  if (jid) {
+    const phone = phoneFromJid(jid) || (lead.telefono || '').replace(/\D/g, '');
     return { jid, phone };
   }
 
-  // 2) Caso habitual: el doc.id ya es JID
-  const rawId = typeof lead.id === 'string' ? lead.id : '';
-  if (rawId.includes('@')) {
-    const jid = normalizeJid(rawId);
-    const phone = jid.split('@')[0].split(':')[0]; // quitar posibles deviceId/lid extras
-    return { jid, phone };
+  const fallbackPhone = (lead.telefono || '').replace(/\D/g, '');
+  if (!fallbackPhone) {
+    return { jid: null, phone: '' };
   }
-
-  // 3) Fallback a teléfono guardado
-  return buildJidFromPhone(lead.telefono || '');
+  try {
+    return buildJidFromPhone(fallbackPhone);
+  } catch {
+    return { jid: null, phone: fallbackPhone };
+  }
 }
 
 
@@ -194,6 +192,10 @@ async function enviarMensaje(lead, mensaje) {
     if (!sock) return;
 
     const { jid, phone } = resolveLeadJidAndPhone(lead);
+    if (!jid) {
+      console.warn(`No se pudo obtener JID para lead ${lead.id || lead.jid || 'sin-id'}`);
+      return;
+    }
 
     switch (mensaje.type) {
       case 'texto': {

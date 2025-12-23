@@ -1,4 +1,8 @@
-import { getWhatsAppSock, buildJidFromPhone } from '../whatsappService.js';
+import {
+  getWhatsAppSock,
+  buildJidFromPhone,
+  extractJidFromLead
+} from '../whatsappService.js';
 import { db } from '../firebaseAdmin.js';  // Asegúrate de tener Firebase Admin configurado
 
 /**
@@ -13,10 +17,18 @@ export async function sendMessage(leadId, message) {
       throw new Error(`Lead con ID ${leadId} no encontrado.`);
     }
     const leadData = leadDoc.data();
-    const telefono = leadData.telefono;
+    const jidFromLead = extractJidFromLead({ id: leadId, ...leadData });
+    let jid = jidFromLead;
 
-    // Formatear el número de teléfono
-    const { jid } = buildJidFromPhone(telefono);
+    if (!jid) {
+      const telefono = leadData.telefono;
+      const built = telefono ? buildJidFromPhone(telefono) : null;
+      jid = built?.jid;
+    }
+
+    if (!jid) {
+      throw new Error(`No se pudo obtener JID para el lead ${leadId}`);
+    }
 
     // Enviar mensaje a WhatsApp
     const sock = getWhatsAppSock();
